@@ -28,6 +28,22 @@ def sudo_pass(stdin, password: str):
     stdin.flush()
 
 
+def wait_for_dpkg_lock(client, password: str):
+    """Wait out any boot-time apt/dpkg lock before running a machine's scripts.
+
+    Service configurations (apache/nginx/bind/ssh/dovecot) call apt-get directly and, unlike
+    configurations.install_package, have no lock-wait of their own. On a freshly-booted box
+    unattended-upgrades holds /var/lib/dpkg/lock-frontend for up to ~2 min, so those installs
+    would fail. Block until the lock clears (or ~2 min elapses)."""
+    cmd = (
+        "sudo -S bash -c 'for i in $(seq 1 60); do "
+        "fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 2; done'"
+    )
+    stdin, stdout, stderr = client.exec_command(cmd)
+    sudo_pass(stdin, password)
+    stdout.read()
+
+
 def build_script(cfg):
     """Prepend any vars as shell-quoted exports so the script can reference $VAR_NAME."""
     if not cfg["vars"]:
@@ -79,6 +95,9 @@ with tempfile.TemporaryDirectory(prefix="nakon-staging-") as staging_dir:
             username=machine["user"],
             password=machine["password"],
         )
+
+        # Clear any boot-time apt lock before the configs' direct apt-get calls run.
+        wait_for_dpkg_lock(client, machine["password"])
 
         for package in dict.fromkeys(fallback_packages):
             print(f"[deploy] Installing package '{package}' via package manager")
