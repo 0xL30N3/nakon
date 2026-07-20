@@ -7,6 +7,7 @@ Called from deploy.py.
 """
 
 import json
+import shlex
 
 
 class CycleError(Exception):
@@ -20,14 +21,14 @@ class UnknownConfigurationError(Exception):
 def fetch(cursor, name: str):
     """Look up a configuration row by name. Returns a dict, or None if not found."""
     cursor.execute(
-        "SELECT id, name, script, run_as, depends_on FROM configurations WHERE name = %s",
+        "SELECT id, name, script, run_as, type, depends_on FROM configurations WHERE name = %s",
         (name,),
     )
     row = cursor.fetchone()
     if row is None:
         return None
 
-    id_, name_, script, run_as, depends_on_raw = row
+    id_, name_, script, run_as, cfg_type, depends_on_raw = row
     if depends_on_raw is None:
         depends_on = []
     elif isinstance(depends_on_raw, list):
@@ -46,6 +47,7 @@ def fetch(cursor, name: str):
         "name": name_,
         "script": script,
         "run_as": run_as,
+        "type": cfg_type,
         "depends_on": depends_on,
         "attachments": attachments,
     }
@@ -78,6 +80,9 @@ def resolve(cursor, requested: list):
 
         row = fetch(cursor, name)
         if row is None:
+            # Mark visited even in the fallback branch so a package requested twice
+            # (e.g. directly and via depends_on) isn't installed twice.
+            visited.add(key)
             if var_values:
                 raise UnknownConfigurationError(
                     f"'{name}' has variables but doesn't match any configuration"
@@ -108,27 +113,36 @@ def install_package(client, password: str, package: str):
     """
     Install a single package using the remote host's package manager.
     Auto-detects apt-get, dnf, or yum.
+
+    The whole sequence runs under a single `sudo -S bash -c '<quoted>'` so that exactly
+    one password prompt consumes the single password line we send on stdin. The package
+    name is shlex-quoted so a hostile/odd name can't inject into the shell command.
     """
     # Boot-time unattended-upgrades holds the dpkg lock for up to ~2 min — wait it out
     # before apt-get (mirrors the same loop used in Terraform Step A for the scoring engine).
     dpkg_wait = (
         "for i in $(seq 1 60); do "
-        "sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; "
+        "fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; "
         "sleep 2; done; "
     )
-    cmd = (
+    safe_pkg = shlex.quote(package)
+    inner = (
         f"if command -v apt-get > /dev/null; then "
         f"{dpkg_wait}"
-        f"sudo -S DEBIAN_FRONTEND=noninteractive apt-get install -y {package}; "
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y {safe_pkg}; "
         f"elif command -v dnf > /dev/null; then "
-        f"sudo -S dnf install -y {package}; "
+        f"dnf install -y {safe_pkg}; "
         f"elif command -v yum > /dev/null; then "
-        f"sudo -S yum install -y {package}; "
+        f"yum install -y {safe_pkg}; "
         f"else echo 'No supported package manager found' >&2; exit 1; fi"
     )
+    # Quote the whole script body as a single argv element to sudo so only the first
+    # sudo call prompts (the inner apt/dnf/yum already run as root under that sudo).
+    cmd = f"sudo -S bash -c {shlex.quote(inner)}"
     stdin, stdout, stderr = client.exec_command(cmd)
     stdin.write(password + "\n")
     stdin.flush()
+    stdin.channel.shutdown_write()
 
     out = stdout.read().decode()
     err = stderr.read().decode()
