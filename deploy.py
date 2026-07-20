@@ -2,6 +2,7 @@ import mysql.connector
 import json
 import paramiko
 import os
+import sys
 import shlex
 import tempfile
 import traceback
@@ -107,6 +108,11 @@ mydb = mysql.connector.connect(**db_config)
 # before the next query runs — otherwise mysql.connector raises "Unread result found".
 cursor = mydb.cursor(buffered=True)
 
+# Track configs that exit non-zero so failures are visible instead of silently swallowed.
+# By default we only report them (a non-zero exit from a benign script shouldn't abort the
+# whole deploy); set NAKON_STRICT=1 to make deploy.py exit non-zero when anything failed.
+failures = []
+
 with tempfile.TemporaryDirectory(prefix="nakon-staging-") as staging_dir:
     for machine in config["machines"]:
         print(f"\n[deploy] ── Machine: {machine['ip']} ──────────────────────────────")
@@ -175,15 +181,31 @@ with tempfile.TemporaryDirectory(prefix="nakon-staging-") as staging_dir:
 
                 out = stdout.read().decode()
                 err = stderr.read().decode()
+                # read() above blocks until the command finishes, so the exit status is ready.
+                rc = stdout.channel.recv_exit_status()
                 if out: print(f"[deploy] {out.strip()}")
                 if err: print(f"[deploy] stderr: {err.strip()}")
+                if rc != 0:
+                    print(f"[deploy] WARNING: config '{cfg['name']}' on {machine['ip']} exited {rc}")
+                    failures.append((machine["ip"], cfg["name"], f"exit {rc}"))
         except Exception as exc:
             # One machine failing (bad creds, host down, a script error) must not leak its
             # SSH channel or abort the rest of the deploy. The finally always closes the
             # client; here we just log and move on to the next machine.
             print(f"[deploy] FAILED on {machine['ip']}: {exc}\n{traceback.format_exc()}")
+            failures.append((machine["ip"], "(machine)", str(exc)))
         finally:
             client.close()
 
 cursor.close()
 mydb.close()
+
+if failures:
+    print(f"\n[deploy] ── {len(failures)} configuration(s) reported failure ──")
+    for ip, name, why in failures:
+        print(f"[deploy]   {ip}  {name}: {why}")
+    # Opt-in hard failure so an orchestrator running with check=True can choose to abort.
+    if os.getenv("NAKON_STRICT"):
+        sys.exit(1)
+else:
+    print("\n[deploy] All configurations completed with exit 0.")
