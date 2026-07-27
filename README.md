@@ -1,6 +1,6 @@
 # nakon
 
-Vulndb client for the dwagsec competition team.
+Vulndb client for the dawgsec competition team.
 
 `nakon` reads a list of target machines and the configurations assigned to each one from a
 MySQL database, then SSHes into every machine and runs each configuration's script.
@@ -71,7 +71,7 @@ apt/dnf/yum branching in a new configuration's own script.
 ### Attachments
 
 A configuration can have file attachments managed through `vulndb-ui` (backed by MinIO) — a
-malicious config file, a installer binary, a PoC, etc. For each configuration that has
+malicious config file, an installer binary, a PoC, etc. For each configuration that has
 attachments, `deploy.py` downloads them from `vulndb-ui` (`GET
 /api/attachments/:id/download`, a redirect to a short-lived presigned MinIO URL) into a local
 temp directory, then SFTPs them onto the target machine's `/tmp` before running the script.
