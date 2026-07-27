@@ -95,7 +95,13 @@ pip install mysql-connector-python paramiko python-dotenv requests
 
 ### 2. Configure the database connection
 
-Create a `.env` file in the project root (this is gitignored):
+Copy the example environment file and fill in your database details:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your MySQL connection details and `vulndb-ui` URL:
 
 ```env
 host=127.0.0.1
@@ -105,7 +111,19 @@ database=vulndb
 VULNDB_UI_URL=http://10.0.0.118:3000
 ```
 
-### 3. Configure target machines
+### 3. Initialize the database
+
+From the `vulndb/` directory, run the seeder to create the schema and populate the
+configuration catalog (reads connection details from `../.env`):
+
+```bash
+cd vulndb && python3 seed_vulndb.py
+```
+
+This creates the `configurations` and `attachments` tables and loads the default catalog.
+Run with `--reset` to drop and recreate everything.
+
+### 4. Configure target machines
 
 Copy the example config and fill in your environment's machines:
 
@@ -137,7 +155,17 @@ Each entry under `configurations` is either a bare configuration name, or an obj
 `name` and a `vars` override. `config.json` is gitignored since it contains live credentials
 and target IPs.
 
-### 4. Run it
+**Alternatively**, use `randomize_config.py` to auto-generate `config.json`:
+
+```bash
+python randomize_config.py
+```
+
+This prompts for the number of VMs and a difficulty level (1–10), then randomly picks
+services and vulnerabilities from the database to build a config. It tries to pull VM
+connection info from a Terraform deployment, falling back to manual prompts.
+
+### 5. Run it
 
 ```bash
 python deploy.py
