@@ -1,101 +1,127 @@
 # nakon
 
-Vulndb client for the dwagsec competition team.
+Vulndb client for the dawgsec competition team.
 
-`nakon` reads a list of target machines and the configurations assigned to each one from a
-MySQL database, then SSHes into every machine and runs each configuration's script.
+`nakon` turns the vulndb configuration catalog into a **content-addressed bundle**, then
+applies that bundle to target machines over SSH. It's built for standing up
+intentionally-vulnerable boxes for blue/red team exercises (e.g. CCDC-style competitions)
+from a central catalog instead of configuring each box by hand.
 
-It's built for standing up intentionally-vulnerable boxes for blue/red team exercises (e.g.
-CCDC-style competitions) from a central catalog instead of configuring each box by hand.
-
-## How it works
+## Two commands, two places
 
 ```
-config.json ──┐
-              ├─▶ deploy.py ─▶ resolves + runs each machine's configurations over SSH
-.env + MySQL ─┘
+                  (needs the vulndb)                    (needs the boxes)
+config.json ──▶ nakon build ──▶ bundles/<id>/ ──▶ nakon deploy ──▶ targets
+.env + MySQL ──┘   + vulndb-ui/MinIO media          paramiko only
 ```
 
-- **MySQL database** stores `configurations` — each row is a named, reusable unit made of
-  exactly one script:
-  - `name` — unique kebab-case slug, e.g. `suid-find`, `apache`, `create-user`
-  - `platform` (`linux`/`windows`/`other`), `category` (`misconfiguration`/`service`/
-    `vulnerability`) — descriptive metadata, not read by `nakon`
-  - `type` (`bash`/`powershell`/`command`), `script`, `run_as` (free text, e.g. `root`)
-  - `depends_on` — JSON array of other configurations (optionally with variables) or raw
-    package names this one needs first; see below
-  - plus an `attachments` table (managed by `vulndb-ui`, see below) for files a configuration's
-    script needs alongside it (payloads, installers, PoCs)
-- **`config.json`** lists target machines and which configurations to run on each.
-- **`deploy.py`** is the entry point: for each machine, it resolves the full dependency graph
-  of its assigned configurations, installs any raw package fallbacks, then runs every
-  configuration's script in dependency-first order over a single SSH connection (via
-  `paramiko`), elevating with `sudo` when `run_as` is `"root"`.
+- **`nakon build`** runs wherever the vulndb is reachable — normally your laptop. It resolves
+  every machine's dependency graph, downloads attachment media, and writes a self-contained
+  bundle of flat, generated scripts.
+- **`nakon deploy`** runs wherever the target boxes are reachable — for competitions, the
+  scoring engine, since it's the only host that routes into the isolated team subnets. It
+  needs `paramiko` and a bundle. **No database, no vulndb-ui, no `.env`.**
 
-A vulnerability and a service install are both just configurations — nothing is conditional on
-some other configuration happening to need it. List a configuration directly on a machine and
+Two things fall out of that split:
+
+1. **Saved competitions replay exactly.** A bundle pins script *content*, not configuration
+   *names*. Re-deploying last month's bundle applies last month's scripts even if someone has
+   since edited them in vulndb-ui. `nakon diff` tells you when that has happened.
+2. **The deploy host never holds vulndb credentials.** Previously the driver copied `.env`,
+   with the database password, onto the scoring engine.
+
+### What a bundle does *not* pin
+
+Your scripts and media — not the internet. `apache`, `bind`, `nginx`, `ssh` and
+`install-package` all still call `apt-get install`, and `splunk` still downloads ~500 MB from
+`download.splunk.com`. A bundle is reproducible in its *inputs*; the deploy still needs
+working DNS, NAT and package mirrors. It is not an offline install.
+
+## The catalog
+
+A **MySQL database** stores `configurations` — each row is a named, reusable unit made of
+exactly one script:
+
+- `name` — unique kebab-case slug, e.g. `suid-find`, `apache`, `create-user`
+- `platform` (`linux`/`windows`/`other`), `category` (`misconfiguration`/`service`/
+  `vulnerability`)
+- `type` (`bash`/`powershell`/`command`), `script`, `run_as` (e.g. `root`)
+- `depends_on` — JSON array of other configurations (optionally with variables) or raw
+  package names this one needs first
+- plus an `attachments` table (managed by `vulndb-ui`, backed by MinIO) for files a script
+  needs alongside it — payloads, installers, PoCs
+
+A vulnerability and a service install are both just configurations. List one on a machine and
 it always runs.
 
-### Configurations and `depends_on`
+### `depends_on`
 
-Each configuration is exactly one script. Multi-step setups aren't expressed as multiple
-scripts under one entry — if a step is reusable, it becomes its own configuration, pulled in
-via `depends_on`. This is also how you chain vulnerabilities for multi-step entry paths (e.g.
-an `apache-runas-root` misconfig as a dependency of a `web-rce` configuration that finishes the
-chain).
+Each entry is either:
 
-`depends_on` is a JSON array. Each entry is either:
-- a bare string — a raw package/service name with no matching configuration, installed via the
-  remote host's package manager (`apt-get`/`dnf`/`yum`) as a fallback, or
-- an object naming another configuration, optionally with variables to pass it:
+- a bare string — a raw package name with no matching configuration, installed via the remote
+  host's package manager (`apt-get`/`dnf`/`yum`/`apk`), or
+- an object naming another configuration, optionally with variables:
   ```json
   { "name": "create-user", "vars": { "USERNAME": "splunk" } }
   ```
 
-A configuration's `script` can reference `vars` as real shell variables — `deploy.py` prepends
-them as shell-quoted exports before uploading the script:
+A configuration's `script` references `vars` as ordinary shell variables:
 
 ```bash
 #!/bin/bash
 useradd -m "$USERNAME"
 ```
 
-The same configuration requested with different `vars` runs once per distinct set of values;
-requested twice with identical `vars` (or none), it only runs once.
-
-`vulndb-ui` ships a few reusable building blocks meant to be depended on rather than
-duplicated — `install-package` (takes `PACKAGE`), `create-user` (takes `USERNAME`), and
-`enable-service` (takes `SERVICE`). Prefer depending on these over hand-rolling
-apt/dnf/yum branching in a new configuration's own script.
+The same configuration requested with different `vars` runs once per distinct set; requested
+twice identically, it runs once. `vulndb-ui` ships reusable blocks meant to be depended on
+rather than duplicated — `install-package` (`PACKAGE`), `create-user` (`USERNAME`),
+`enable-service` (`SERVICE`). Prefer those over hand-rolling apt/dnf branching.
 
 ### Attachments
 
-A configuration can have file attachments managed through `vulndb-ui` (backed by MinIO) — a
-malicious config file, a installer binary, a PoC, etc. For each configuration that has
-attachments, `deploy.py` downloads them from `vulndb-ui` (`GET
-/api/attachments/:id/download`, a redirect to a short-lived presigned MinIO URL) into a local
-temp directory, then SFTPs them onto the target machine's `/tmp` before running the script.
-The script can reference them by relative path since `deploy.py` `cd`s into `/tmp` before
-running it:
+Attachments are downloaded at **build** time and travel inside the bundle. Each step gets its
+own working directory containing its attachments, so a script refers to them by relative path:
 
 ```bash
 cp ./malicious.conf /etc/vsftpd.conf
 ```
 
-This requires `VULNDB_UI_URL` to point at a reachable `vulndb-ui` instance (see below) — it's
-only used for attachment downloads, everything else talks to MySQL directly.
+(Before bundles, attachments were dropped in `/tmp` and the script ran with `/tmp` as its
+working directory. The relative-path contract is unchanged; a script that hardcoded
+`/tmp/<name>` instead would now break, and `nakon build` warns if it finds one.)
+
+## What a bundle looks like
+
+```
+bundles/
+  .cache/attachments/<sha256>       # download cache — deletable, never referenced by a manifest
+  <bundle-id>/
+    manifest.json                   # provenance, request→plan map, per-step detail
+    blobs/<sha256>                  # scripts and media, deduped
+    plans/<plan-id>/
+      run.sh | run.ps1              # generated, straight-line driver
+      steps/NNN-<name>.sh           # each catalog script, byte-for-byte
+      vars/NNN.env                  # shell-quoted variables for that step
+      files/NNN/                    # that step's attachments = that step's working directory
+    plans/<plan-id>.tar.gz          # per-plan transport slice
+```
+
+**Plans are keyed by the request** — platform plus the ordered configuration list — never by
+machine name. Every team gets the same list per box type, so `web01-team101/102/103` share
+one plan, and a bundle built from one team's `config.json` deploys all of them.
+
+Nothing is interpreted on the target. `run.sh` is flat generated bash you can read; script
+bodies are never inlined into it, so a configuration's own `set -e` or `exit 0` stays inside
+that configuration and one failure never aborts the rest of the box.
 
 ## Setup
 
-### 1. Install dependencies
-
 ```bash
-pip install mysql-connector-python paramiko python-dotenv requests
+pip install mysql-connector-python paramiko python-dotenv requests   # build host
+pip install paramiko                                                 # deploy host only
 ```
 
-### 2. Configure the database connection
-
-Create a `.env` file in the project root (this is gitignored):
+Create `.env` in the project root (gitignored) — **build side only**:
 
 ```env
 host=127.0.0.1
@@ -105,13 +131,7 @@ database=vulndb
 VULNDB_UI_URL=http://10.0.0.118:3000
 ```
 
-### 3. Configure target machines
-
-Copy the example config and fill in your environment's machines:
-
-```bash
-cp config-example.json config.json
-```
+`config.json` lists the target machines (gitignored — live credentials and IPs):
 
 ```json
 {
@@ -133,31 +153,76 @@ cp config-example.json config.json
 }
 ```
 
-Each entry under `configurations` is either a bare configuration name, or an object with a
-`name` and a `vars` override. `config.json` is gitignored since it contains live credentials
-and target IPs.
+`config-example.json` is a starting point. Generate one from the catalog with
+`python3 -m nakon randomize`.
 
-### 4. Run it
+## Usage
 
 ```bash
-python deploy.py
+python3 -m nakon build                       # -> bundles/<id>/, or reuses a matching one
+python3 -m nakon build --rebuild             # ignore the cache
+python3 -m nakon build --export cde-2026.tar.gz   # archive it alongside the competition
+
+python3 -m nakon show   --bundle bundles/<id>     # what's in it (offline)
+python3 -m nakon diff   --bundle bundles/<id>     # has the catalog moved since?
+
+python3 -m nakon deploy --bundle bundles/<id>
+python3 -m nakon deploy --bundle bundles/<id> --jobs 4 --strict
 ```
 
-This will, for every machine in `config.json`:
+`build` prints whether it built fresh or reused a cached bundle. The cache key is the catalog
+state, so re-running after no vulndb changes costs one round of queries.
 
-1. Resolve its assigned configurations' full `depends_on` graph (deduped, dependency-first)
-2. SSH in, install any raw package-manager fallbacks, then upload and run each resolved
-   configuration's script in order (with `sudo` if `run_as` is `"root"`)
+Useful `deploy` flags:
 
-## Adding a new configuration
+| flag | effect |
+|---|---|
+| `--jobs N` | deploy N machines in parallel (default 1) |
+| `--strict` | exit non-zero if any configuration failed (same as `NAKON_STRICT=1`) |
+| `--only NAME...` | deploy just these machines, by name or IP |
+| `--keep-remote` | leave the unpacked plan on each box for debugging |
+| `--no-logs` | don't save per-machine logs under `bundles/<id>/runs/` |
 
-Insert a row into the `configurations` table (e.g. via the `vulndb-ui` admin app) — there's no
-plugin system to register. A configuration that other configurations should be able to depend
-on (a reusable building block like `create-user`) just needs a unique `name` and a `script`
-that reads any `vars` it needs as shell variables.
+A configuration exiting non-zero is reported, not fatal, and one unreachable machine never
+stops the others — `--strict` is there for an orchestrator that wants to abort.
+
+### On-target footprint
+
+The plan is unpacked to a `mktemp -d` under `/root` (mode 0700) and **deleted when the run
+finishes**. That's deliberate: the bundle lists every vulnerability planted on that box, the
+competition's own setup grants the default user passwordless sudo, and team1's disk gets
+cloned to every other team. `--keep-remote` opts out; don't leave it on for a live event.
+
+## Adding a configuration
+
+Insert a row into the `configurations` table (e.g. via the `vulndb-ui` admin app) — there's
+no plugin system. A configuration other configurations can depend on just needs a unique
+`name` and a `script` that reads any `vars` it needs as shell variables. Then rebuild:
+`nakon diff` will show you exactly what changed.
+
+## Tests
+
+```bash
+python3 -m pytest                # unit tier: no database, no MinIO, no VMs
+python3 -m pytest -m proxmox     # live tier: clones real VMs (see tests/proxmox/README.md)
+```
+
+The unit tier executes generated `run.sh` files for real to prove step isolation, and asserts
+that a team1-only build and a full-competition build produce the same bundle id.
+
+## Windows
+
+Windows configurations generate a `run.ps1` with a real elevation guard — nakon does not
+self-elevate over SSH, so the SSH principal must already be an administrator. Transport is
+OpenSSH + SFTP with a zip instead of a tarball.
+
+**This path has never run against a real Windows box** — there is no Windows template on the
+team's Proxmox, so it is covered by generation-level tests only. Treat the first Windows box
+as a bring-up, not a deploy.
 
 ## Security note
 
 This tool intentionally deploys vulnerable configurations and SSHes around with plaintext
-passwords from `config.json`/`.env`. It's meant for isolated competition/lab environments only —
-never point it at production infrastructure or expose these credentials.
+passwords from `config.json`/`.env`. Built bundles contain the full list of what gets planted
+where. It's meant for isolated competition/lab environments only — never point it at
+production infrastructure or expose these credentials.
