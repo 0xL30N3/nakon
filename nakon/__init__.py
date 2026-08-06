@@ -14,3 +14,35 @@ much the catalog has moved on since, and the deploy host never holds vulndb cred
 """
 
 __version__ = "2.0.0"
+
+# Public API for callers embedding nakon rather than shelling out to it.
+#
+# Resolved lazily (PEP 562) rather than imported at module scope, because the import discipline
+# in cli.py applies here too: `nakon deploy` runs on the scoring engine with only paramiko, and
+# `import nakon` must not drag in the build half. `from nakon import build` pulls in the builder
+# only at the moment it is asked for.
+__all__ = ["build", "deploy", "summarize", "Bundle", "load_machines", "__version__"]
+
+
+def __getattr__(name):
+    if name == "build":
+        from .build.builder import build
+
+        return build
+    if name == "load_machines":
+        from .build.builder import load_machines
+
+        return load_machines
+    if name in ("deploy", "summarize"):
+        from .deploy import runner
+
+        return getattr(runner, name)
+    if name == "Bundle":
+        from .deploy.bundle import Bundle
+
+        return Bundle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)

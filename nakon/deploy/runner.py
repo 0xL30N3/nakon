@@ -206,6 +206,47 @@ def deploy(bundle, machines, keep_remote=False, jobs=1, log_dir=None, emit=print
         return [future.result() for future in futures]
 
 
+def outcomes_to_dict(bundle, outcomes: list, log_dir=None) -> dict:
+    """Serialize a deploy run for an orchestrator.
+
+    Per-step results were only ever written to the run's .tsv on disk, so anything driving nakon
+    had to locate and parse those files (or scrape the human summary) to find out what happened.
+    This is the same information as one document.
+    """
+    machines = []
+    for outcome in outcomes:
+        machines.append({
+            "name": outcome.name,
+            "ip": outcome.machine.get("ip"),
+            "plan_id": outcome.plan_id,
+            "error": outcome.error,
+            "exit_status": outcome.exit_status,
+            "steps": [
+                {
+                    "index": r.index,
+                    "name": r.name,
+                    "kind": r.kind,
+                    "rc": r.rc,
+                    "seconds": r.seconds,
+                }
+                for r in outcome.progress.results()
+            ],
+            "failures": [
+                {"ip": ip, "step": name, "reason": why}
+                for ip, name, why in outcome.failures()
+            ],
+        })
+
+    failures = sum(len(m["failures"]) for m in machines)
+    return {
+        "bundle_id": bundle.bundle_id,
+        "machines": machines,
+        "failures": failures,
+        "ok": failures == 0,
+        "log_dir": str(log_dir) if log_dir is not None else None,
+    }
+
+
 def summarize(outcomes: list, emit=print) -> list:
     """Print the end-of-run summary and return the flat failure list."""
     failures = []

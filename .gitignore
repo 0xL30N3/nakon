@@ -6,6 +6,3 @@ __pycache__
 # Built bundles: they hold attachment media and the full list of vulnerabilities planted on
 # each box. Archive one with `nakon build --export <name>.tar.gz` instead of committing it.
 bundles/
-
-# Proxmox API token for the opt-in live test tier (tests/proxmox/.env.example is the template).
-tests/proxmox/.env

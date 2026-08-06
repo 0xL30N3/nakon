@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nakon"
+version = "2.0.0"
+description = "Build reproducible deployment bundles from the vulndb catalog, and apply them."
+readme = "README.md"
+requires-python = ">=3.9"
+
+# Deliberately empty. `nakon deploy` runs on the scoring engine, which has paramiko and nothing
+# else, and it is often not installed at all — tezcatlipoca scp's the package directory over and
+# runs `python3 -m nakon` from it. Declaring build-side requirements here would either break that
+# host or lie about what it needs, so the two halves are extras instead.
+dependencies = []
+
+[project.optional-dependencies]
+build = ["mysql-connector-python", "requests", "python-dotenv"]
+deploy = ["paramiko"]
+
+# No [project.scripts]. `python3 -m nakon` is the only entry point, so a plain directory copy
+# behaves identically to an install — see nakon/__main__.py.
+
+[tool.setuptools]
+# Named explicitly: the repo root also holds randomize_config.py (a compatibility shim loaded by
+# path, not imported), and flat-layout auto-discovery would either pick it up or refuse to guess.
+packages = ["nakon", "nakon.build", "nakon.catalog", "nakon.deploy", "nakon.gen"]

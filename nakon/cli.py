@@ -18,6 +18,17 @@ from .errors import BundleError, NakonError
 from .hashing import short
 
 
+def _log(message=""):
+    """Progress and diagnostics go to stderr; stdout carries the command's result.
+
+    That separation is what lets a caller do `nakon build --json | jq` — or pipe `diff`'s drift
+    lines into something — without having to strip log noise first. It also keeps the older
+    contract working: tezcatlipoca reads `stdout.splitlines()[-1]` from `build --json`, and with
+    logs on stderr that JSON is simply the only line there.
+    """
+    print(message, file=sys.stderr)
+
+
 def _load_env():
     """Load .env if python-dotenv is available. Build-side convenience only."""
     try:
@@ -43,16 +54,16 @@ def cmd_build(args) -> int:
             Path(args.config),
             Path(args.out),
             rebuild=args.rebuild,
+            log=_log,
         )
     finally:
         source.close()
 
     if args.export:
         _export(Path(result["path"]), Path(args.export))
-        print(f"[nakon] exported {short(result['bundle_id'])} to {args.export}")
+        _log(f"[nakon] exported {short(result['bundle_id'])} to {args.export}")
 
     if args.json:
-        # Last line, so a caller can take stdout.splitlines()[-1] regardless of log noise.
         print(json.dumps(result))
     return 0
 
@@ -78,8 +89,8 @@ def cmd_deploy(args) -> int:
         if not machines:
             raise NakonError(f"--only {sorted(wanted)} matched no machine in {args.config}")
 
-    print(f"[nakon] bundle {short(bundle.bundle_id)} "
-          f"(built {bundle.manifest.get('built_at')} by {bundle.manifest.get('built_by')})")
+    _log(f"[nakon] bundle {short(bundle.bundle_id)} "
+         f"(built {bundle.manifest.get('built_at')} by {bundle.manifest.get('built_by')})")
 
     # Pre-flight: every machine must map to a plan before anything is deployed to any of
     # them. A machine the bundle doesn't cover is an operator error — the wrong bundle, or a
@@ -95,13 +106,13 @@ def cmd_deploy(args) -> int:
             uncovered.append(str(exc))
     if uncovered:
         for message in uncovered:
-            print(f"[nakon] error: {message}", file=sys.stderr)
-        print(f"\n[nakon] {len(uncovered)} machine(s) are not covered by this bundle; "
-              f"nothing was deployed.", file=sys.stderr)
+            _log(f"[nakon] error: {message}")
+        _log(f"\n[nakon] {len(uncovered)} machine(s) are not covered by this bundle; "
+             f"nothing was deployed.")
         return 1
 
-    print(f"[nakon] deploying {len(machines)} machine(s)"
-          + (f" with {args.jobs} in parallel" if args.jobs > 1 else ""))
+    _log(f"[nakon] deploying {len(machines)} machine(s)"
+         + (f" with {args.jobs} in parallel" if args.jobs > 1 else ""))
 
     log_dir = None
     if not args.no_logs:
@@ -114,11 +125,17 @@ def cmd_deploy(args) -> int:
         keep_remote=args.keep_remote,
         jobs=args.jobs,
         log_dir=log_dir,
+        emit=_log,
     )
-    failures = summarize(outcomes)
+    failures = summarize(outcomes, emit=_log)
 
     if log_dir is not None and log_dir.exists():
-        print(f"[nakon] logs: {log_dir}")
+        _log(f"[nakon] logs: {log_dir}")
+
+    if args.json:
+        from .deploy.runner import outcomes_to_dict
+
+        print(json.dumps(outcomes_to_dict(bundle, outcomes, log_dir), indent=2, sort_keys=True))
 
     strict = args.strict or os.getenv("NAKON_STRICT")
     if failures and strict:
@@ -171,17 +188,25 @@ def cmd_diff(args) -> int:
     finally:
         source.close()
 
-    print(f"[nakon] bundle {short(bundle.bundle_id)} vs the live catalog "
-          f"({len(recorded)} configuration(s) recorded)")
+    if args.json:
+        print(json.dumps({
+            "bundle_id": bundle.bundle_id,
+            "recorded": len(recorded),
+            "drift": [{"kind": k, "name": n, "detail": d} for k, n, d in changes],
+        }, indent=2, sort_keys=True))
+        return 2 if (changes and args.exit_code) else 0
+
+    _log(f"[nakon] bundle {short(bundle.bundle_id)} vs the live catalog "
+         f"({len(recorded)} configuration(s) recorded)")
     if not changes:
-        print("[nakon] no drift — the catalog still matches this bundle.")
+        _log("[nakon] no drift — the catalog still matches this bundle.")
         return 0
 
-    print(f"[nakon] {len(changes)} difference(s):")
+    _log(f"[nakon] {len(changes)} difference(s):")
     for kind, name, detail in changes:
-        print(f"[nakon]   {kind:8} {name}: {detail}")
-    print("[nakon] Deploying this bundle still applies the ORIGINAL content above; "
-          "run `nakon build` to pick up the changes.")
+        print(f"{kind:8} {name}: {detail}")
+    _log("[nakon] Deploying this bundle still applies the ORIGINAL content above; "
+         "run `nakon build` to pick up the changes.")
     return 2 if args.exit_code else 0
 
 
@@ -234,6 +259,134 @@ def cmd_randomize(args) -> int:
     return 0
 
 
+def _wrap(text: str, width: int, indent: str) -> str:
+    import textwrap
+
+    return "\n".join(textwrap.wrap(text, width=width, initial_indent=indent,
+                                   subsequent_indent=indent)) or ""
+
+
+def cmd_catalog_list(args) -> int:
+    _load_env()
+    from .catalog.query import list_configurations, open_source
+
+    source = open_source(args.source)
+    try:
+        rows = list_configurations(
+            source,
+            platform=args.platform,
+            category=args.category,
+            search=args.search,
+            include_blocks=args.include_blocks,
+        )
+    finally:
+        source.close()
+
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+
+    if not rows:
+        print("[nakon] no configurations match those filters.")
+        return 0
+
+    for row in rows:
+        attachments = row["attachments"]
+        suffix = f"  [{len(attachments)} attachment(s)]" if attachments else ""
+        print(f"{str(row['id']):>4}  {row['platform']:<8} {row['category']:<17} "
+              f"{row['name']}{suffix}")
+        if row["description"]:
+            print(_wrap(row["description"], 96, " " * 8))
+        else:
+            print(f"{' ' * 8}(no description)")
+    print(f"\n[nakon] {len(rows)} configuration(s)")
+    return 0
+
+
+def cmd_catalog_show(args) -> int:
+    _load_env()
+    from .catalog.query import describe, open_source
+
+    source = open_source(args.source)
+    try:
+        entries = describe(source, args.names, args.platform)
+    finally:
+        source.close()
+
+    if args.json:
+        print(json.dumps(entries, indent=2, sort_keys=True))
+        return 0
+
+    for entry in entries:
+        print(f"{entry['name']}  ({entry['category']}, {entry['platform']}, "
+              f"type={entry['type']}, run_as={entry['run_as']})")
+        print(_wrap(entry["description"] or "(no description)", 96, "    "))
+        if entry["depends_on"]:
+            print(f"    depends_on: {json.dumps(entry['depends_on'])}")
+        if entry["attachments"]:
+            names = ", ".join(a["original_name"] for a in entry["attachments"])
+            print(f"    attachments: {names}")
+
+        resolved = entry.get("resolved")
+        if resolved is None:
+            print(f"    does not resolve on {args.platform}: {entry.get('resolve_error')}")
+        else:
+            print(f"    resolves to {resolved['steps']} step(s) on {args.platform}")
+            print(f"      configurations: {', '.join(resolved['configurations'])}")
+            if resolved["packages"]:
+                print(f"      packages:       {', '.join(resolved['packages'])}")
+            if resolved["services"]:
+                print(f"      services:       {', '.join(resolved['services'])}")
+            if resolved["attachment_bytes"]:
+                print(f"      media:          {resolved['attachment_bytes']} bytes")
+        print()
+    return 0
+
+
+def cmd_catalog_check(args) -> int:
+    _load_env()
+    from .catalog.query import boxes_from_config, boxes_from_pins, check_selection, open_source
+
+    if args.config:
+        boxes = boxes_from_config(args.config)
+    elif args.box_vulns:
+        boxes = boxes_from_pins(args.box_vulns, args.box_services, args.platform)
+    elif args.select:
+        names = [n for chunk in args.select for n in chunk.split(",") if n.strip()]
+        boxes = [{"name": "<selection>", "platform": args.platform, "configurations": names}]
+    else:
+        raise NakonError("give one of --select, --config or --box-vulns")
+
+    source = open_source(args.source)
+    try:
+        report = check_selection(source, boxes)
+    finally:
+        source.close()
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for box in report["boxes"]:
+            print(f"{box['name']}  ({box['platform']}, {len(box['requested'])} selected)")
+            for problem in box["problems"]:
+                where = f" {problem['config']}:" if problem["config"] else ""
+                print(f"  {problem['level']:<7}{where} {problem['message']}")
+            resolved = box["resolved"]
+            if resolved is not None:
+                print(f"  ok      resolves to {resolved['steps']} step(s)"
+                      + (f", {len(resolved['packages'])} package(s)" if resolved["packages"] else "")
+                      + (f", {resolved['attachment_bytes']} bytes of media"
+                         if resolved["attachment_bytes"] else ""))
+            print()
+        print(f"[nakon] {report['errors']} error(s), {report['warnings']} warning(s)")
+
+    if report["errors"]:
+        return 1
+    if report["warnings"] and args.strict:
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nakon",
@@ -268,11 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
                           help="deploy only these machines, by name or IP")
     p_deploy.add_argument("--no-logs", action="store_true",
                           help="don't save per-machine logs under the bundle's runs/ directory")
+    p_deploy.add_argument("--json", action="store_true",
+                          help="print per-step results as JSON on stdout, for orchestrators")
     p_deploy.set_defaults(func=cmd_deploy)
 
     p_diff = sub.add_parser("diff", help="compare a bundle against the live catalog")
     p_diff.add_argument("--bundle", required=True)
     p_diff.add_argument("--exit-code", action="store_true", help="exit 2 when drift is found")
+    p_diff.add_argument("--json", action="store_true")
     p_diff.set_defaults(func=cmd_diff)
 
     p_show = sub.add_parser("show", help="describe a bundle (offline)")
@@ -282,6 +438,54 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rand = sub.add_parser("randomize", help="generate a config.json from the catalog")
     p_rand.set_defaults(func=cmd_randomize)
+
+    # `catalog` is the read/verify half: what is available, and is a proposed selection sane.
+    # It never writes and never builds, so it is safe to point an agent at.
+    p_cat = sub.add_parser("catalog", help="browse the catalog and vet a selection")
+    cat_sub = p_cat.add_subparsers(dest="catalog_command", required=True)
+
+    def _add_source(p):
+        p.add_argument("--source", choices=("auto", "http", "mysql"), default="auto",
+                       help="where to read the catalog (default: auto — vulndb-ui over HTTP if "
+                            "VULNDB_UI_URL is set, otherwise MySQL)")
+
+    p_cat_list = cat_sub.add_parser("list", help="list configurations, with descriptions")
+    p_cat_list.add_argument("--platform", choices=("linux", "windows", "other"))
+    p_cat_list.add_argument("--category",
+                            choices=("misconfiguration", "service", "vulnerability"))
+    p_cat_list.add_argument("--search", metavar="TEXT",
+                            help="substring match over name, description and script")
+    p_cat_list.add_argument("--include-blocks", action="store_true",
+                            help="also show reusable building blocks "
+                                 "(install-package, create-user, enable-service)")
+    p_cat_list.add_argument("--json", action="store_true")
+    _add_source(p_cat_list)
+    p_cat_list.set_defaults(func=cmd_catalog_list)
+
+    p_cat_show = cat_sub.add_parser("show",
+                                    help="one configuration in full, and what it pulls in")
+    p_cat_show.add_argument("names", nargs="+", metavar="NAME")
+    p_cat_show.add_argument("--platform", default="linux", choices=("linux", "windows"))
+    p_cat_show.add_argument("--json", action="store_true")
+    _add_source(p_cat_show)
+    p_cat_show.set_defaults(func=cmd_catalog_show)
+
+    p_cat_check = cat_sub.add_parser("check", help="vet a selection before it is built")
+    p_cat_check.add_argument("--select", nargs="+", metavar="NAME",
+                             help="configuration names, comma- or space-separated")
+    p_cat_check.add_argument("--config", metavar="FILE",
+                             help="check every machine in a nakon config.json")
+    p_cat_check.add_argument("--box-vulns", metavar="FILE",
+                             help="check a tezcatlipoca box_vulns.json")
+    p_cat_check.add_argument("--box-services", metavar="FILE",
+                             help="the matching box_services.json, checked alongside it")
+    p_cat_check.add_argument("--platform", default="linux", choices=("linux", "windows"),
+                             help="platform for --select and --box-vulns (default: linux)")
+    p_cat_check.add_argument("--strict", action="store_true",
+                             help="exit non-zero on warnings too, not just errors")
+    p_cat_check.add_argument("--json", action="store_true")
+    _add_source(p_cat_check)
+    p_cat_check.set_defaults(func=cmd_catalog_check)
 
     return parser
 

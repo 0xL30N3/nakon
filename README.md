@@ -43,6 +43,9 @@ A **MySQL database** stores `configurations` — each row is a named, reusable u
 exactly one script:
 
 - `name` — unique kebab-case slug, e.g. `suid-find`, `apache`, `create-user`
+- `description` — prose: what it changes on the box, why a real system would plausibly have it,
+  what a defender would notice. The only place difficulty, realism and cross-configuration
+  couplings are recorded, and what `nakon catalog` exists to surface
 - `platform` (`linux`/`windows`/`other`), `category` (`misconfiguration`/`service`/
   `vulnerability`)
 - `type` (`bash`/`powershell`/`command`), `script`, `run_as` (e.g. `root`)
@@ -121,6 +124,10 @@ pip install mysql-connector-python paramiko python-dotenv requests   # build hos
 pip install paramiko                                                 # deploy host only
 ```
 
+Or, equivalently, via the extras: `pip install -e '.[build]'` / `pip install -e '.[deploy]'`.
+Installing is optional — `python3 -m nakon` runs from a plain directory copy, which is how the
+scoring engine gets it.
+
 Create `.env` in the project root (gitignored) — **build side only**:
 
 ```env
@@ -168,10 +175,48 @@ python3 -m nakon diff   --bundle bundles/<id>     # has the catalog moved since?
 
 python3 -m nakon deploy --bundle bundles/<id>
 python3 -m nakon deploy --bundle bundles/<id> --jobs 4 --strict
+
+python3 -m nakon catalog list                     # what's in the catalog
+python3 -m nakon catalog show suid-find           # one config, and what it pulls in
+python3 -m nakon catalog check --select a,b,c     # is this selection sane?
 ```
 
 `build` prints whether it built fresh or reused a cached bundle. The cache key is the catalog
 state, so re-running after no vulndb changes costs one round of queries.
+
+### Output convention
+
+**Progress and diagnostics go to stderr; the command's result goes to stdout.** So
+`nakon build --json | jq` works, and `diff`'s drift lines pipe cleanly. `--json` is available on
+`build`, `deploy`, `diff`, `show` and every `catalog` subcommand, and prints one object.
+
+### `catalog` — reading the catalog and vetting a selection
+
+Read-only. Never builds, never writes, so it is safe to point an agent at.
+
+```bash
+python3 -m nakon catalog list --platform linux --category misconfiguration --json
+python3 -m nakon catalog list --search ssh
+python3 -m nakon catalog show www-data-shell --json
+python3 -m nakon catalog check --platform linux --select suid-find,ssh-root-login
+python3 -m nakon catalog check --box-vulns competitions/x/box_vulns.json \
+                               --box-services competitions/x/box_services.json
+python3 -m nakon catalog check --config config.json
+```
+
+`check` catches what nothing else does. An unknown name is **not** an error anywhere else in the
+toolchain — `resolve` treats it as a raw package name, so a typo like `suid-fnd` becomes
+`apt-get install suid-fnd` and the box gets nothing. It also catches building blocks requested
+directly, windows configurations on linux boxes, dependency cycles, empty-script no-ops,
+duplicates and services pulled in by dependencies. Exit 0 clean, 1 on errors, `--strict` to fail
+on warnings too.
+
+`--source auto|http|mysql` chooses where to read: `auto` uses vulndb-ui over HTTP when
+`VULNDB_UI_URL` is set — which needs **no database credentials**, the usual case for an agent —
+and falls back to MySQL. `build` always uses MySQL directly, because the HTTP API omits
+attachments' `object_key`, which the source fingerprint hashes.
+
+See [`docs/agent-selection.md`](docs/agent-selection.md) for the intended agent workflow.
 
 Useful `deploy` flags:
 
@@ -182,6 +227,7 @@ Useful `deploy` flags:
 | `--only NAME...` | deploy just these machines, by name or IP |
 | `--keep-remote` | leave the unpacked plan on each box for debugging |
 | `--no-logs` | don't save per-machine logs under `bundles/<id>/runs/` |
+| `--json` | per-step results as one JSON object on stdout |
 
 A configuration exiting non-zero is reported, not fatal, and one unreachable machine never
 stops the others — `--strict` is there for an orchestrator that wants to abort.
@@ -195,20 +241,40 @@ cloned to every other team. `--keep-remote` opts out; don't leave it on for a li
 
 ## Adding a configuration
 
-Insert a row into the `configurations` table (e.g. via the `vulndb-ui` admin app) — there's
-no plugin system. A configuration other configurations can depend on just needs a unique
-`name` and a `script` that reads any `vars` it needs as shell variables. Then rebuild:
-`nakon diff` will show you exactly what changed.
+Insert a row into the `configurations` table — there's no plugin system. Either use the
+`vulndb-ui` admin app, or its CLI:
+
+```bash
+vulndb-cli create --file new-config.json --yes
+vulndb-cli describe suid-find "Sets the SUID bit on find, so any user can …" --yes
+```
+
+A configuration other configurations can depend on just needs a unique `name` and a `script`
+that reads any `vars` it needs as shell variables. Give it a `description` — without one,
+nothing choosing a competition's set has anything to go on but the slug and the script. Then
+rebuild: `nakon diff` will show you exactly what changed.
+
+## Using nakon from another project
+
+`python3 -m nakon` is the entry point, and `--config` / `--out` take paths, so a consumer keeps
+its own files in its own repo rather than writing into this checkout. Parse `--json` from stdout;
+logs are on stderr.
+
+To embed it instead, `pip install -e path/to/nakon` and:
+
+```python
+from nakon import build, deploy, summarize, Bundle, load_machines
+```
+
+These resolve lazily, so `import nakon` on a deploy host still doesn't pull in the build half.
+`pyproject.toml` declares **no required dependencies** — the two halves are extras
+(`nakon[build]`, `nakon[deploy]`) — because the scoring engine often runs nakon from a plain
+directory copy with only paramiko installed, and that has to keep working.
 
 ## Tests
 
-```bash
-python3 -m pytest                # unit tier: no database, no MinIO, no VMs
-python3 -m pytest -m proxmox     # live tier: clones real VMs (see tests/proxmox/README.md)
-```
-
-The unit tier executes generated `run.sh` files for real to prove step isolation, and asserts
-that a team1-only build and a full-competition build produce the same bundle id.
+No automated test suite exists in this checkout. Verification is manual — see `PROGRESS.md` for
+what's actually been exercised against real infrastructure.
 
 ## Windows
 
@@ -217,8 +283,7 @@ self-elevate over SSH, so the SSH principal must already be an administrator. Tr
 OpenSSH + SFTP with a zip instead of a tarball.
 
 **This path has never run against a real Windows box** — there is no Windows template on the
-team's Proxmox, so it is covered by generation-level tests only. Treat the first Windows box
-as a bring-up, not a deploy.
+team's Proxmox. Treat the first Windows box as a bring-up, not a deploy.
 
 ## Security note
 
