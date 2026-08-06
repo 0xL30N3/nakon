@@ -135,7 +135,7 @@ def cmd_deploy(args) -> int:
     if args.json:
         from .deploy.runner import outcomes_to_dict
 
-        print(json.dumps(outcomes_to_dict(bundle, outcomes, log_dir), indent=2, sort_keys=True))
+        print(json.dumps(outcomes_to_dict(bundle, outcomes, log_dir)))
 
     strict = args.strict or os.getenv("NAKON_STRICT")
     if failures and strict:
