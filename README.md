@@ -282,8 +282,24 @@ Windows configurations generate a `run.ps1` with a real elevation guard — nako
 self-elevate over SSH, so the SSH principal must already be an administrator. Transport is
 OpenSSH + SFTP with a zip instead of a tarball.
 
-**This path has never run against a real Windows box** — there is no Windows template on the
-team's Proxmox. Treat the first Windows box as a bring-up, not a deploy.
+**Tested end-to-end against a real Windows box** (Windows 10, the team's Proxmox
+`windows-workshop-template`, vmid 903) — see PROGRESS.md for the bring-up notes. Two real bugs
+only showed up against a live box and are now fixed:
+
+- `Start-Process -NoNewWindow` shares the parent's console with the child — and when run.ps1
+  is itself started over a non-interactive SSH exec channel (no pty, no console, exactly how
+  nakon's own transport invokes it), there is no console for the child to share, so it hangs
+  indefinitely instead of erroring. Fixed by launching each step with explicitly redirected
+  stdout/stderr instead, which needs no console at all.
+- Most catalog scripts are cmdlet-only and never set `$LASTEXITCODE`; a non-terminating cmdlet
+  error (the common case) doesn't make `powershell.exe` itself exit non-zero either, so a
+  script that fails every cmdlet it calls was still reported a success. Each step now computes
+  and self-reports a real exit code (external command's `$LASTEXITCODE`, else whether
+  `$Error` collected anything).
+
+The `winget`/`choco` package-manager fallback (`render_package_step`) was not exercised by
+this pass — nothing in the test selection pulled in a raw package dependency on Windows — and
+remains untested.
 
 ## Security note
 

@@ -54,8 +54,10 @@ class RunProgress:
             return True
 
         if stripped.startswith(MARKER_RC):
-            # ##nakon rc <idx> <rc> <secs>
-            parts = stripped[len(MARKER_RC):].strip().split()
+            # ##nakon rc <idx>\t<rc>\t<secs> — tab-delimited, matching report.tsv, so an
+            # unexpectedly empty field is preserved as its own token instead of collapsing
+            # into a neighboring one the way plain whitespace-splitting would.
+            parts = stripped[len(MARKER_RC):].strip().split("\t")
             if len(parts) >= 2:
                 index = parts[0]
                 result = self.steps.get(index)

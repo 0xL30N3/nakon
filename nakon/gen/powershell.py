@@ -7,16 +7,25 @@ anything unless it is already running elevated, and says so clearly.
 
 Each step is a separate `powershell.exe` process, for the same isolation reasons as the bash
 generator, plus one Windows-specific one: `$LASTEXITCODE` is not set by cmdlet-only scripts
-(`Set-NetFirewallProfile -Enabled False` returns nothing at all), so the only reliable exit
-code is the child process's own.
+(`Set-NetFirewallProfile -Enabled False` returns nothing at all), so nakon computes and
+self-reports a real exit code per step rather than trusting either one — see Nakon-Step and
+render_step_ps1 below for exactly what that took to get right over a real SSH exec channel.
 
-UNTESTED END-TO-END: there is no Windows template on the team's Proxmox, so this path is
-covered by generation-level tests only. Treat the first real Windows box as a bring-up.
+Tested end-to-end against a real Windows box (Windows 10, cloned from the team's Proxmox
+`windows-workshop-template`) — see PROGRESS.md for the bring-up notes and the bugs that first
+pass found: `Start-Process -NoNewWindow`'s console-sharing hangs indefinitely when the parent
+itself has no console (exactly nakon's own SSH exec transport), and even once processes
+launch reliably, non-terminating cmdlet errors (the majority of real catalog-script failures)
+don't make powershell.exe exit non-zero on their own.
 """
 
 from . import MARKER_BEGIN, MARKER_DONE, MARKER_RC, step_basename, step_label
 
 DEFAULT_STEP_TIMEOUT = 1800
+
+# Relative to each step's own working directory (the process's CWD, via -WorkingDirectory),
+# so the step script can write it with a bare filename regardless of where the plan landed.
+STEP_RC_FILE = ".nakon-step-rc"
 
 
 def ps_quote(value) -> str:
@@ -25,18 +34,46 @@ def ps_quote(value) -> str:
 
 
 def render_step_ps1(script: str, var_values: dict) -> str:
-    """A step's script with its vars prepended.
+    """A step's script with its vars prepended and an explicit exit code appended.
 
     PowerShell has no clean way to source a vars file into a `-File` child's scope, so the
     assignments are baked into a copy of the script at build time. The original body is
     preserved verbatim below them.
+
+    Most catalog scripts are cmdlet-only and never set $LASTEXITCODE — and critically, a
+    *non-terminating* cmdlet error (parameter binding failures, "command not found", most of
+    what catalog scripts actually hit) does not make powershell.exe exit non-zero on its own;
+    the process happily exits 0 having merely written to its error stream. Left alone, that
+    means a script that fails every cmdlet it calls is still reported as a success. The
+    trailer below computes a real exit code: an external command's $LASTEXITCODE wins if the
+    script set one, otherwise any error recorded in this process's $Error collection (cleared
+    first, so only this script's errors count) means failure.
+
+    That code is both `exit`ed *and* written to a file in the step's own working directory
+    (a bare relative filename — -WorkingDirectory makes that directory the process's CWD).
+    The file is the value Nakon-Step actually trusts: `Process.ExitCode` after
+    `Start-Process -PassThru` is genuinely unreliable for short-lived, quiet processes (a
+    known .NET/PowerShell gotcha — confirmed against a real Windows box, where every step that
+    produced no console output came back with an empty exit code even with the process
+    handle pre-touched, while the one step that happened to print errors did not), so the
+    real process exit code is a fallback for the case the file never gets written at all —
+    the process crashed, or was killed for exceeding the step timeout — not the primary path.
     """
-    if not var_values:
-        return script
     header = "".join(
         f"${key} = {ps_quote(value)}\r\n" for key, value in sorted(var_values.items())
     )
-    return f"# nakon: variables for this step\r\n{header}\r\n{script}"
+    if header:
+        header = f"# nakon: variables for this step\r\n{header}\r\n"
+    trailer = (
+        "\r\n# nakon: compute a real exit code — see render_step_ps1 docstring.\r\n"
+        "if ($LASTEXITCODE) { $__nakon_rc = $LASTEXITCODE }\r\n"
+        "elseif ($Error.Count -gt 0) { $__nakon_rc = 1 }\r\n"
+        "else { $__nakon_rc = 0 }\r\n"
+        f"Set-Content -LiteralPath {ps_quote(STEP_RC_FILE)} -Value $__nakon_rc -NoNewline "
+        "-ErrorAction SilentlyContinue\r\n"
+        "exit $__nakon_rc\r\n"
+    )
+    return f"{header}$Error.Clear()\r\n{script}\r\n{trailer}"
 
 
 def render_package_step(package: str) -> str:
@@ -86,27 +123,82 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
 }}
 
 function Nakon-Record($idx, $name, $kind, $rc, $secs) {{
+    # $rc must never reach the report as a blank field — an empty token between two tabs (or
+    # two spaces on the live "##nakon rc" line) silently collapses when the Python side splits
+    # on whitespace, shifting $secs into the rc column and making a real failure look "done".
+    # -1 is not a real process exit code, so it reads unambiguously as "nakon couldn't tell".
+    #
+    # $null check ONLY — confirmed against a real box that `-or $rc -eq ''` is actively wrong,
+    # not just redundant: PowerShell's -eq coerces the empty string to match the left operand's
+    # type, so when $rc is the *integer* 0 (a real, successful exit code), `$rc -eq ''`
+    # evaluates true, and every clean success was being stomped to -1 right here.
+    if ($null -eq $rc) {{ $rc = -1 }}
     Add-Content -LiteralPath $script:Report -Value ("{{0}}`t{{1}}`t{{2}}`t{{3}}`t{{4}}" -f $idx, $name, $kind, $rc, $secs)
-    Write-Output "{MARKER_RC} $idx $rc $secs"
+    # Tab-delimited, matching report.tsv, on purpose: a plain-space-delimited line can't tell
+    # an empty field from a separator, so an unexpected blank here would silently shift $secs
+    # into the rc column on the Python side instead of being visibly wrong.
+    Write-Output ("{MARKER_RC} {{0}}`t{{1}}`t{{2}}" -f $idx, $rc, $secs)
     if ($rc -ne 0) {{ $script:Failed++ }}
 }}
 
-# One step = one powershell.exe. Cmdlet-only scripts never set $LASTEXITCODE, so the child
-# process's ExitCode is the only exit status that can be trusted.
+# One step = one powershell.exe, launched WITHOUT -NoNewWindow. That flag shares the
+# parent's console with the child — and confirmed against a real box, when run.ps1 is itself
+# started over a non-interactive SSH exec channel (no pty, no console — exactly how nakon's
+# ssh.py invokes it), there is no console for the child to share: Start-Process -NoNewWindow
+# then hangs indefinitely, WaitForExit never returns true, and the step times out with no
+# output ever seen, regardless of what the step script actually did. Redirecting the child's
+# streams explicitly sidesteps console attachment entirely, works the same whether nakon is
+# run interactively or not, and — as a bonus — makes .ExitCode reliable too (the empty
+# .ExitCode / Start-Process -PassThru gotcha only came up in combination with -NoNewWindow).
+# ProcessStartInfo.Arguments is used instead of the newer .ArgumentList collection: the
+# latter can be a null property depending on the target's .NET Framework version.
 function Nakon-Step($script, $workdir, $idx, $name, $kind) {{
     $t0 = Get-Date
-    $rc = 0
+    $rc = $null
     try {{
         if (-not (Test-Path -LiteralPath $workdir)) {{ New-Item -ItemType Directory -Path $workdir -Force | Out-Null }}
-        $proc = Start-Process -FilePath 'powershell.exe' -PassThru -NoNewWindow `
-            -WorkingDirectory $workdir `
-            -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script)
+        $rcFile = Join-Path $workdir {ps_quote(STEP_RC_FILE)}
+        Remove-Item -LiteralPath $rcFile -Force -ErrorAction SilentlyContinue
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell.exe'
+        $psi.WorkingDirectory = $workdir
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $stepArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script)
+        $psi.Arguments = ($stepArgs | ForEach-Object {{ '"' + $_.Replace('"', '\\"') + '"' }}) -join ' '
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Started before WaitForExit so the pipes are drained concurrently — reading only
+        # after the process exits risks a classic deadlock if a chatty step fills the OS
+        # pipe buffer before anyone reads it.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
         if (-not $proc.WaitForExit($StepTimeout * 1000)) {{
             Write-Error "[nakon] step $idx ($name) exceeded ${{StepTimeout}}s — killing"
             try {{ $proc.Kill() }} catch {{ }}
             $rc = 124
         }} else {{
-            $rc = $proc.ExitCode
+            # Not truly live line-by-line the way console-sharing would have been, but that
+            # only ever worked over an interactive session anyway — this trades that for
+            # actually working over the SSH exec channel nakon really uses.
+            if ($stdoutTask.Result) {{ Write-Output $stdoutTask.Result.TrimEnd("`r", "`n") }}
+            if ($stderrTask.Result) {{ Write-Output $stderrTask.Result.TrimEnd("`r", "`n") }}
+            if (Test-Path -LiteralPath $rcFile) {{
+                $fileRc = (Get-Content -LiteralPath $rcFile -Raw).Trim()
+                $parsedRc = 0
+                if ([int]::TryParse($fileRc, [ref]$parsedRc)) {{
+                    $rc = $parsedRc
+                }} else {{
+                    $rc = $proc.ExitCode
+                }}
+                Remove-Item -LiteralPath $rcFile -Force -ErrorAction SilentlyContinue
+            }} else {{
+                $rc = $proc.ExitCode
+            }}
         }}
     }} catch {{
         Write-Error "[nakon] step $idx ($name) failed to start: $_"
