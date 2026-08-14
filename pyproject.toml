@@ -23,12 +23,12 @@ deploy = ["paramiko"]
 # behaves identically to an install — see nakon/__main__.py.
 
 [tool.setuptools]
+# Named explicitly so flat-layout auto-discovery doesn't pick up stray top-level scripts.
+packages = ["nakon", "nakon.build", "nakon.catalog", "nakon.deploy", "nakon.gen"]
+
 # Single source of truth for the version is nakon/__init__.py:__version__. A static string (not
 # setuptools-scm) is deliberate — nakon is copied as a bare directory and run with nothing
 # installed (tezcatlipoca scp's it to the scoring engine), where there is no git history or
 # installed metadata to derive a version from.
 [tool.setuptools.dynamic]
 version = {attr = "nakon.__version__"}
-
-# Named explicitly so flat-layout auto-discovery doesn't pick up stray top-level scripts.
-packages = ["nakon", "nakon.build", "nakon.catalog", "nakon.deploy", "nakon.gen"]
