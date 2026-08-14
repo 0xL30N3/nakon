@@ -140,7 +140,12 @@ exit $RUN_RC
 
 
 def render_bootstrap_ps1(archive_remote: str, keep_remote: bool) -> str:
-    """Generated bootstrap for a Windows target. UNTESTED — no Windows box exists yet."""
+    """Generated bootstrap for a Windows target.
+
+    Verified end-to-end against real Windows Server 2022 boxes, including a full domain-join
+    scenario (ADDS forest promotion + client join) driven through tezcatlipoca — see that
+    project's `create-competition.py`/`deploy_windows_domain_configs()`.
+    """
     cleanup = (
         "Write-Output \"[nakon] plan kept at $D (--keep-remote)\""
         if keep_remote

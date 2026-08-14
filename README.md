@@ -181,6 +181,16 @@ OpenSSH + SFTP with a zip instead of a tarball. Each step self-reports a real ex
 command's `$LASTEXITCODE`, else whether `$Error` collected anything), because most catalog scripts
 are cmdlet-only and never set `$LASTEXITCODE` on their own.
 
+Verified end-to-end against real Windows Server 2022 boxes, including the full domain-join
+scenario: `ADDS` promotes a box to a new AD forest, `Domain Join` (`Add-Computer`) joins another
+box to it, and AD-aware catalog rows (`Add User Account`/`Elevate User Account`/`Disable System
+Firewall`) correctly create/elevate real AD objects once run against a live DC — driven through
+tezcatlipoca's `create-competition.py`/`deploy_windows_domain_configs()`, which handles the
+reboot-tolerant sequencing this needs (ADDS and Domain Join each reboot the box, so each has to
+run in its own single-config deploy pass, and cloning has to happen before any DC is promoted,
+never after). The one remaining untested corner is the `winget`/`choco` package-manager fallback
+(`render_package_step`) — no catalog config exercised in this pass used it.
+
 ## Releasing
 
 1. Bump `__version__` in `nakon/__init__.py`.
