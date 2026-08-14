@@ -253,9 +253,91 @@ def cmd_show(args) -> int:
 
 def cmd_randomize(args) -> int:
     _load_env()
+
+    # Non-interactive selection mode: any selection spec (--platform/--os, --services/--vulns,
+    # --difficulty, --exclude, or --json) selects one platform's worth of services+vulns and
+    # prints it. This is what an orchestrator (tezcatlipoca's generate_nakon_config) calls
+    # instead of importing nakon.catalog.randomize internals — it keeps the selection algorithm
+    # in one place behind a stable CLI. With no spec at all, fall through to the original
+    # interactive standalone flow (prompts for VMs/difficulty, writes config.json).
+    import math
+
+    has_spec = any(
+        v is not None
+        for v in (args.platform, args.os, args.services, args.vulns, args.difficulty)
+    ) or args.exclude or args.json
+    if has_spec:
+        return _randomize_select(args, math)
+
     from .catalog.randomize import main as randomize_main
 
     randomize_main()
+    return 0
+
+
+def _randomize_select(args, math) -> int:
+    """Headless `nakon randomize`: read the catalog, pick services+vulns, emit JSON.
+
+    Budgets come either explicitly (--services/--vulns) or derived from --difficulty exactly as
+    the standalone interactive main() does (services = ceil(d/3), vulns = d), then handed to
+    pick_configurations() uncapped — it simply stops accepting once the budget is met, so a small
+    catalog yields fewer rather than erroring.
+    """
+    from .catalog.query import open_source
+    from .catalog.randomize import EXCLUDED_NAMES, os_to_platform, pick_configurations
+
+    if args.os:
+        platform = os_to_platform(args.os)
+    else:
+        platform = args.platform or "linux"
+
+    services = args.services
+    vulns = args.vulns
+    if args.difficulty is not None:
+        if services is None:
+            services = max(math.ceil(args.difficulty / 3), 1)
+        if vulns is None:
+            vulns = max(args.difficulty, 1)
+    if services is None or vulns is None:
+        raise NakonError(
+            "non-interactive randomize needs --services and --vulns "
+            "(or --difficulty to derive both)"
+        )
+
+    source = open_source(args.source)
+    try:
+        name_to_row = {}
+        for row in source.all_rows():
+            name = row["name"]
+            if name in EXCLUDED_NAMES:
+                continue
+            name_to_row[name] = {
+                "category": row["category"],
+                "platform": row["platform"],
+                "depends_on": row.get("depends_on") or [],
+            }
+        for name in args.exclude or []:
+            name_to_row.pop(name, None)
+    finally:
+        source.close()
+
+    services_picked, vulns_picked, services_in_use = pick_configurations(
+        name_to_row, platform, services, vulns
+    )
+
+    if args.json:
+        print(json.dumps({
+            "platform": platform,
+            "services": services_picked,
+            "vulns": vulns_picked,
+        }))
+        return 0
+
+    _log(f"[nakon] randomized selection for platform={platform}")
+    _log(f"  services: {services_picked}")
+    _log(f"  vulns/misconfigs: {vulns_picked}")
+    _log(f"  distinct services after dependency resolution: {len(services_in_use)} "
+         f"(budget {services})")
     return 0
 
 
@@ -436,7 +518,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--json", action="store_true")
     p_show.set_defaults(func=cmd_show)
 
-    p_rand = sub.add_parser("randomize", help="generate a config.json from the catalog")
+    p_rand = sub.add_parser(
+        "randomize",
+        help="pick services+vulns from the catalog (non-interactive), or build a config.json "
+             "(no flags = interactive)",
+    )
+    p_rand.add_argument("--platform", choices=("linux", "windows"),
+                        help="target platform (mutually convenient with --os)")
+    p_rand.add_argument("--os", metavar="TEXT",
+                        help="free-text os field (ubuntu24.04, windows2019, …) mapped to a platform")
+    p_rand.add_argument("--services", type=int, metavar="N",
+                        help="how many services to pick (a budget; fewer if the catalog is small)")
+    p_rand.add_argument("--vulns", type=int, metavar="N",
+                        help="how many vulns/misconfigurations to pick")
+    p_rand.add_argument("--difficulty", type=int, metavar="N",
+                        help="derive --services/--vulns from a 1-10 difficulty (ceil(d/3) and d) "
+                             "when either is omitted")
+    p_rand.add_argument("--exclude", nargs="+", metavar="NAME",
+                        help="configuration names to leave out of the pool before picking")
+    p_rand.add_argument("--json", action="store_true",
+                        help="emit {platform, services, vulns} as JSON (for orchestrators)")
+    p_rand.add_argument("--source", choices=("auto", "http", "mysql"), default="auto",
+                        help="where to read the catalog (default: auto)")
     p_rand.set_defaults(func=cmd_randomize)
 
     # `catalog` is the read/verify half: what is available, and is a proposed selection sane.

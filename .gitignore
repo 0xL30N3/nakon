@@ -6,3 +6,13 @@ __pycache__
 # Built bundles: they hold attachment media and the full list of vulnerabilities planted on
 # each box. Archive one with `nakon build --export <name>.tar.gz` instead of committing it.
 bundles/
+
+# Bundle exports and one-off operational patch scripts at the repo root are not part of the library.
+*.tar.gz
+/fix-*.py
+
+# Local-only bring-up/verification log — contains real credentials; never commit.
+PROGRESS.md
+
+# Local agent/IDE config.
+.claude/

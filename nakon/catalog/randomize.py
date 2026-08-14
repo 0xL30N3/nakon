@@ -1,9 +1,11 @@
 """Randomized config.json generation — picks services and vulns scaled by a difficulty level.
 
-Moved verbatim (bar the lazy mysql import) from the old top-level randomize_config.py. The
-behaviour is deliberately unchanged: tezcatlipoca's create-competition.py loads the root
-shim by file path and calls load_configurations / os_to_platform / pick_configurations to
-build its own machine list, so any change here changes what competitions get generated.
+`pick_configurations` is the selection algorithm. It is called two ways:
+
+  * `python3 -m nakon randomize --services N --vulns M --json` — headless, for orchestrators
+    (tezcatlipoca's generate_nakon_config). The CLI wiring lives in cli.py:_randomize_select.
+  * `main()` here — the interactive standalone flow that prompts for VMs/difficulty and writes
+    a config.json, for a human building a one-off range by hand.
 """
 
 import json
