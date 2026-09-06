@@ -4,6 +4,18 @@ All notable changes to nakon are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] — 2026-08-15
+
+### Fixed
+- `catalog.resolve()` emitted a second, vars-less copy of a configuration that was both
+  requested directly (with vars) and pulled in by another request's `depends_on` — e.g.
+  "Elevate User Account" depends on "Add User Account", so a plan carrying both produced
+  step 000 Add (with vars, works) and step 001 Add again (no vars, `New-ADUser` fails on
+  null parameters). A bare re-request (empty vars) of an already-emitted configuration is
+  now satisfied by the earlier emission; requests carrying their own vars still emit per
+  distinct set, so the create-user-for-several-usernames pattern is unchanged. Found live
+  in tezcatlipoca's win-linux-practice deploy.
+
 ## [0.1.2] — 2026-08-14
 
 ### Fixed (vulndb catalog content, not this package's code)

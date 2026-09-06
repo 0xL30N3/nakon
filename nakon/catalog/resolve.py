@@ -55,6 +55,13 @@ def resolve(source, requested: list, platform: str = "linux") -> list:
     twice with identical vars runs once; requested with different vars runs once per distinct
     set, which is how `create-user` gets used for several usernames.
 
+    A bare re-request (empty vars) of an already-emitted configuration is satisfied by that
+    earlier emission instead of emitting a second, vars-less copy. This is the depends_on
+    shape: "Elevate User Account" pulls in "Add User Account" with no vars, so a plan that
+    also requests "Add User Account" directly (with its username/password/...) must not get
+    a duplicate Add step with every parameter null. Requests that carry vars of their own
+    still emit per distinct set — only the empty-vars form dedupes against history.
+
     Returns a list of dicts, each either:
       {"kind": "package", "package": str}
       {"kind": "config", "name", "config_id", "script", "run_as", "type", "vars",
@@ -63,10 +70,13 @@ def resolve(source, requested: list, platform: str = "linux") -> list:
     ordered = []
     visited = set()
     visiting = set()
+    emitted = set()  # config names already in `ordered` (packages are deduped by `visited`)
 
     def visit(name, var_values, path):
         key = (name, tuple(sorted(var_values.items())))
         if key in visited:
+            return
+        if not var_values and name in emitted:
             return
         if key in visiting:
             raise CycleError(
@@ -95,6 +105,7 @@ def resolve(source, requested: list, platform: str = "linux") -> list:
         visiting.discard(key)
 
         visited.add(key)
+        emitted.add(name)
         ordered.append({
             "kind": "config",
             "name": row["name"],
